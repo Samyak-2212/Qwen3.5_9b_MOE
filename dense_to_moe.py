@@ -407,15 +407,23 @@ def convert_ffn_block(
 
         w = tensor_to_f32(tensor)
 
-        # --- Shared expert: direct copy of original FFN ---
+        # --- Shared expert ---
+        # ffn_down_shexp is zeroed so shexp_out = 0 regardless of gate value.
+        # This avoids output scaling issues from an unlearned gate weight.
         if shared_expert:
             shexp_key = f"{prefix}.{sub}_shexp.weight"
-            shexp_data = f32_to_output(w, out_np_dtype, out_qtype)
-            if out_qtype is not None:
-                writer.add_tensor(shexp_key, shexp_data, raw_dtype=out_qtype)
+            if sub == "ffn_down":
+                shexp_data = np.zeros_like(w)
             else:
-                writer.add_tensor(shexp_key, shexp_data)
-            del shexp_data
+                shexp_data = w
+            out_shexp = f32_to_output(shexp_data, out_np_dtype, out_qtype)
+            if out_qtype is not None:
+                writer.add_tensor(shexp_key, out_shexp, raw_dtype=out_qtype)
+            else:
+                writer.add_tensor(shexp_key, out_shexp)
+            del out_shexp
+            if sub == "ffn_down":
+                del shexp_data
 
         # --- Routed experts: N copies with noise, stacked as 3D tensor ---
         is_down = (sub == "ffn_down")
@@ -441,11 +449,9 @@ def convert_ffn_block(
             writer.add_tensor(exp_key, exp_data)
         del exp_data
 
-    # --- Shared expert gate ---
-    # sigmoid(dot(cur, gate_w)): init to -10 so sigmoid(-10)~=0, suppressing shared expert.
-    # Zero init would give sigmoid(0)=0.5 and add 0.5*FFN on top of moe_out, scaling output 1.5x.
+    # Shared expert gate -- value irrelevant since ffn_down_shexp=0, but required by the format.
     if shared_expert:
-        gate = np.full(n_embd, -10.0, dtype=np.float32)
+        gate = np.zeros(n_embd, dtype=np.float32)
         writer.add_tensor(f"{prefix}.ffn_gate_inp_shexp.weight", gate)
         del gate
 
