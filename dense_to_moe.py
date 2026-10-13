@@ -146,11 +146,24 @@ def parse_moe_layers(spec, n_layer):
     try:
         if "-" in spec:
             a, b = spec.split("-", 1)
-            return set(range(int(a), int(b) + 1))
-        return {int(x) for x in spec.split(",")}
+            start = int(a)
+            end = int(b)
+            if start > end:
+                eprint(f"error: invalid --moe-layers range '{spec}': start ({start}) cannot exceed end ({end})")
+                sys.exit(1)
+            layers = set(range(start, end + 1))
+        else:
+            layers = {int(x) for x in spec.split(",")}
     except (ValueError, TypeError) as exc:
         eprint(f"error: invalid --moe-layers specification '{spec}': {exc}")
         sys.exit(1)
+
+    for idx in layers:
+        if idx < 0 or idx >= n_layer:
+            eprint(f"error: layer index {idx} in --moe-layers is out of range [0, {n_layer - 1}]")
+            sys.exit(1)
+
+    return layers
 
 
 def tensor_to_f32(tensor):
@@ -462,6 +475,23 @@ def main():
 
     out_np_dtype, out_qtype = OUTPUT_DTYPES[args.output_type]
 
+    # Validate CLI arguments
+    if args.num_experts < 1:
+        eprint(f"error: --num-experts must be at least 1, got {args.num_experts}")
+        sys.exit(1)
+    if args.top_k < 1:
+        eprint(f"error: --top-k must be at least 1, got {args.top_k}")
+        sys.exit(1)
+    if args.top_k > args.num_experts:
+        eprint(f"error: --top-k ({args.top_k}) cannot exceed --num-experts ({args.num_experts})")
+        sys.exit(1)
+    if args.noise_scale < 0:
+        eprint(f"error: --noise-scale cannot be negative, got {args.noise_scale}")
+        sys.exit(1)
+    if args.expert_ff_size is not None and args.expert_ff_size < 1:
+        eprint(f"error: --expert-ff-size must be at least 1, got {args.expert_ff_size}")
+        sys.exit(1)
+
     if not os.path.exists(args.input):
         eprint(f"error: input file '{args.input}' not found")
         sys.exit(1)
@@ -525,68 +555,91 @@ def main():
     # Build index of tensors by name for fast lookup
     tensors_by_name = {t.name: t for t in reader.tensors}
 
-    # --- Write output ---
-    eprint(f"Writing {args.output} ...")
-    writer = GGUFWriter(args.output, MOE_ARCH, use_temp_file=True)
+    writer = None
+    try:
+        # --- Write output ---
+        eprint(f"Writing {args.output} ...")
+        writer = GGUFWriter(args.output, MOE_ARCH, use_temp_file=True)
 
-    # Metadata
-    eprint("Writing metadata...")
-    copy_metadata(reader, writer, MOE_ARCH, args, n_ff, n_embd, n_layer)
+        # Metadata
+        eprint("Writing metadata...")
+        copy_metadata(reader, writer, MOE_ARCH, args, n_ff, n_embd, n_layer)
 
-    # Tensors -- iterate in the same order as the input GGUF
-    eprint("Writing tensors...")
+        # Tensors -- iterate in the same order as the input GGUF
+        eprint("Writing tensors...")
 
-    # Track which FFN tensors have been handled as part of a block
-    handled = set()
-    total = len(reader.tensors)
+        # Track which FFN tensors have been handled as part of a block
+        handled = set()
+        total = len(reader.tensors)
 
-    for idx, tensor in enumerate(reader.tensors):
-        name = tensor.name
+        for idx, tensor in enumerate(reader.tensors):
+            name = tensor.name
 
-        if idx % 20 == 0 or idx == total - 1:
-            eprint(f"  [{idx+1}/{total}] {name}")
+            if idx % 20 == 0 or idx == total - 1:
+                eprint(f"  [{idx+1}/{total}] {name}")
 
-        # Determine block index if this is a block tensor
-        blk_idx = None
-        if name.startswith("blk."):
-            parts = name.split(".")
-            try:
-                blk_idx = int(parts[1])
-            except (IndexError, ValueError):
-                pass
+            # Determine block index if this is a block tensor
+            blk_idx = None
+            if name.startswith("blk."):
+                parts = name.split(".")
+                try:
+                    blk_idx = int(parts[1])
+                except (IndexError, ValueError):
+                    pass
 
-        # Check if it's an FFN tensor in a MoE layer
-        is_ffn = (
-            blk_idx is not None and
-            blk_idx in moe_layers and
-            any(f".{sub}.weight" in name for sub in FFN_SUBTENSORS)
-        )
-
-        if is_ffn and name not in handled:
-            # Convert the whole block's FFN at once on the first FFN tensor we hit
-            eprint(f"  -> converting block {blk_idx} FFN to MoE")
-            convert_ffn_block(
-                writer, tensors_by_name,
-                blk_idx, n_ff, n_embd,
-                args.num_experts, args.noise_scale, args.shared_expert,
-                out_np_dtype, out_qtype, expert_ff, rng,
+            # Check if it's an FFN tensor in a MoE layer
+            is_ffn = (
+                blk_idx is not None and
+                blk_idx in moe_layers and
+                any(f".{sub}.weight" in name for sub in FFN_SUBTENSORS)
             )
-            # Mark all three FFN tensors as handled
-            for sub in FFN_SUBTENSORS:
-                handled.add(f"blk.{blk_idx}.{sub}.weight")
-        elif name in handled:
-            # Already written as part of FFN block conversion above
-            continue
-        else:
-            # Pass through unchanged
-            passthrough_tensor(writer, tensor)
 
-    # Finalize
-    eprint("Finalizing GGUF...")
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file(progress=True)
-    writer.close()
+            if is_ffn and name not in handled:
+                # Convert the whole block's FFN at once on the first FFN tensor we hit
+                eprint(f"  -> converting block {blk_idx} FFN to MoE")
+                convert_ffn_block(
+                    writer, tensors_by_name,
+                    blk_idx, n_ff, n_embd,
+                    args.num_experts, args.noise_scale, args.shared_expert,
+                    out_np_dtype, out_qtype, expert_ff, rng,
+                )
+                # Mark all three FFN tensors as handled
+                for sub in FFN_SUBTENSORS:
+                    handled.add(f"blk.{blk_idx}.{sub}.weight")
+            elif name in handled:
+                # Already written as part of FFN block conversion above
+                continue
+            else:
+                # Pass through unchanged
+                passthrough_tensor(writer, tensor)
+
+        # Finalize
+        eprint("Finalizing GGUF...")
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file(progress=True)
+        writer.close()
+    except (Exception, KeyboardInterrupt) as exc:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            if getattr(writer, "temp_file", None) is not None:
+                try:
+                    writer.temp_file.close()
+                except Exception:
+                    pass
+        if os.path.exists(args.output):
+            try:
+                os.unlink(args.output)
+            except OSError:
+                pass
+        if isinstance(exc, KeyboardInterrupt):
+            eprint("\nInterrupted.")
+        else:
+            eprint(f"error: conversion failed: {exc}")
+        sys.exit(1)
 
     size_mb = os.path.getsize(args.output) / (1024 * 1024)
     eprint(f"Done. Output: {args.output} ({size_mb:.0f} MB)")
