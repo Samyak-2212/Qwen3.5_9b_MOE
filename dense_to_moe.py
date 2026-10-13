@@ -150,18 +150,18 @@ def parse_moe_layers(spec, n_layer):
 
 
 def tensor_to_f32(tensor):
-    """Dequantize a reader tensor to a numpy float32 array."""
+    """Dequantize a reader tensor to a numpy float32 array in (rows, cols) layout."""
     qtype = tensor.tensor_type
     if qtype == GGMLQuantizationType.F32:
-        return tensor.data.view(np.float32).reshape(list(tensor.shape))
+        return tensor.data.view(np.float32).reshape(tuple(reversed(tensor.shape)))
     if qtype == GGMLQuantizationType.F16:
-        return tensor.data.view(np.float16).reshape(list(tensor.shape)).astype(np.float32)
+        return tensor.data.view(np.float16).reshape(tuple(reversed(tensor.shape))).astype(np.float32)
     if qtype == GGMLQuantizationType.BF16:
-        raw = tensor.data.view(np.uint16).reshape(list(tensor.shape))
+        raw = tensor.data.view(np.uint16).reshape(tuple(reversed(tensor.shape)))
         # BF16 -> F32: insert 16 zero bits at the low end
         f32 = (raw.astype(np.uint32) << 16).view(np.float32)
         return f32
-    # quantized types: dequantize returns float32
+    # quantized types: dequantize returns float32 in (rows, cols) layout
     return dequantize(tensor.data, qtype)
 
 
@@ -346,19 +346,17 @@ def copy_metadata(reader, writer, arch_out, args, n_ff, n_embd, n_layer):
 def passthrough_tensor(writer, tensor):
     """Copy a tensor from reader to writer without modification."""
     qtype = tensor.tensor_type
-    shape = list(tensor.shape)
 
     if qtype in QTYPE_TO_NP:
         # Float types: reshape raw bytes
         np_dtype = QTYPE_TO_NP[qtype]
-        data = tensor.data.view(np_dtype).reshape(shape)
+        data = tensor.data.view(np_dtype).reshape(tuple(reversed(tensor.shape)))
         writer.add_tensor(tensor.name, data)
     else:
-        # Quantized: pass raw bytes with explicit shape + dtype hints
+        # Quantized: pass raw bytes with dtype hint; raw_shape defaults to tensor.data.shape
         writer.add_tensor(
             tensor.name,
             tensor.data,
-            raw_shape=shape,
             raw_dtype=qtype,
         )
 
@@ -397,26 +395,32 @@ def convert_ffn_block(
         if shared_expert:
             shexp_key = f"{prefix}.{sub}_shexp.weight"
             shexp_data = f32_to_output(w, out_np_dtype, out_qtype)
-            shexp_shape = list(w.shape)
             if out_qtype is not None:
-                writer.add_tensor(shexp_key, shexp_data, raw_shape=shexp_shape, raw_dtype=out_qtype)
+                writer.add_tensor(shexp_key, shexp_data, raw_dtype=out_qtype)
             else:
                 writer.add_tensor(shexp_key, shexp_data)
             del shexp_data
 
         # --- Routed experts: N copies with noise, stacked as 3D tensor ---
         is_down = (sub == "ffn_down")
-        exp_3d = make_expert_tensor(w, num_experts, noise_scale, rng, is_down)
+        w_exp = w
+        if expert_ff_size is not None and expert_ff_size != n_ff:
+            if is_down:
+                w_exp = w[:, :expert_ff_size] if expert_ff_size < n_ff else np.pad(w, ((0, 0), (0, expert_ff_size - n_ff)))
+            else:
+                w_exp = w[:expert_ff_size, :] if expert_ff_size < n_ff else np.pad(w, ((0, expert_ff_size - n_ff), (0, 0)))
+
+        exp_3d = make_expert_tensor(w_exp, num_experts, noise_scale, rng, is_down)
         del w
+        if w_exp is not w:
+            del w_exp
 
         exp_key = f"{prefix}.{sub}_exps.weight"
-        # shape: [ne0, ne1, n_expert] -- GGUF column-major
-        exp_shape = list(exp_3d.shape)
         exp_data = f32_to_output(exp_3d, out_np_dtype, out_qtype)
         del exp_3d
 
         if out_qtype is not None:
-            writer.add_tensor(exp_key, exp_data, raw_shape=exp_shape, raw_dtype=out_qtype)
+            writer.add_tensor(exp_key, exp_data, raw_dtype=out_qtype)
         else:
             writer.add_tensor(exp_key, exp_data)
         del exp_data
