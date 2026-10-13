@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.log
+.agents/
+tests/
+PROJECT.md
+TEST_*.md

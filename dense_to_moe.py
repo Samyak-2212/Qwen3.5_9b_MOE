@@ -76,8 +76,8 @@ def parse_args(args=None):
     p.add_argument("--output-type", default="F16",
                    choices=list(OUTPUT_DTYPES.keys()),
                    help="Expert tensor output type (default: F16)")
-    p.add_argument("--noise-scale", type=float, default=0.01,
-                   help="Expert weight noise = noise_scale * std(weights) (default: 0.01)")
+    p.add_argument("--noise-scale", type=float, default=0.0,
+                   help="Expert weight noise = noise_scale * std(weights) (default: 0.0)")
     p.add_argument("--moe-layers", default="all",
                    help='Layers to convert: "all" or range like "0-31" (default: all)')
     p.add_argument("--convert-mtp", dest="convert_mtp",
@@ -393,9 +393,8 @@ def convert_ffn_block(
     """
     prefix = f"blk.{layer_idx}"
 
-    # --- Router: small random Gaussian ---
-    # Shape (num_experts, n_embd) so GGUF receives [n_embd, num_experts]
-    router = rng.normal(0.0, 0.02 / np.sqrt(n_embd), (num_experts, n_embd)).astype(np.float32)
+    # Router: zero init -> softmax gives uniform weights -> exact dense FFN output preserved
+    router = np.zeros((num_experts, n_embd), dtype=np.float32)
     writer.add_tensor(f"{prefix}.ffn_gate_inp.weight", router)
     del router
 
@@ -442,9 +441,11 @@ def convert_ffn_block(
             writer.add_tensor(exp_key, exp_data)
         del exp_data
 
-    # --- Shared expert gate: zeros -> sigmoid(0) = 0.5 ---
+    # --- Shared expert gate ---
+    # sigmoid(dot(cur, gate_w)): init to -10 so sigmoid(-10)~=0, suppressing shared expert.
+    # Zero init would give sigmoid(0)=0.5 and add 0.5*FFN on top of moe_out, scaling output 1.5x.
     if shared_expert:
-        gate = np.zeros(n_embd, dtype=np.float32)
+        gate = np.full(n_embd, -10.0, dtype=np.float32)
         writer.add_tensor(f"{prefix}.ffn_gate_inp_shexp.weight", gate)
         del gate
 
