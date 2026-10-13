@@ -143,10 +143,14 @@ def get_meta_str_arr(reader, key, default=None):
 def parse_moe_layers(spec, n_layer):
     if spec == "all":
         return set(range(n_layer))
-    if "-" in spec:
-        a, b = spec.split("-", 1)
-        return set(range(int(a), int(b) + 1))
-    return {int(x) for x in spec.split(",")}
+    try:
+        if "-" in spec:
+            a, b = spec.split("-", 1)
+            return set(range(int(a), int(b) + 1))
+        return {int(x) for x in spec.split(",")}
+    except (ValueError, TypeError) as exc:
+        eprint(f"error: invalid --moe-layers specification '{spec}': {exc}")
+        sys.exit(1)
 
 
 def tensor_to_f32(tensor):
@@ -411,9 +415,9 @@ def convert_ffn_block(
                 w_exp = w[:expert_ff_size, :] if expert_ff_size < n_ff else np.pad(w, ((0, expert_ff_size - n_ff), (0, 0)))
 
         exp_3d = make_expert_tensor(w_exp, num_experts, noise_scale, rng, is_down)
-        del w
         if w_exp is not w:
             del w_exp
+        del w
 
         exp_key = f"{prefix}.{sub}_exps.weight"
         exp_data = f32_to_output(exp_3d, out_np_dtype, out_qtype)
@@ -458,6 +462,10 @@ def main():
 
     out_np_dtype, out_qtype = OUTPUT_DTYPES[args.output_type]
 
+    if not os.path.exists(args.input):
+        eprint(f"error: input file '{args.input}' not found")
+        sys.exit(1)
+
     # --- Read input ---
     eprint(f"Loading {args.input} ...")
     reader = GGUFReader(args.input)
@@ -480,23 +488,21 @@ def main():
 
     # Validate against llama.cpp qwen35moe constraints
     if not args.shared_expert:
-        eprint("error: llama.cpp qwen35moe architecture requires shared expert tensors (blk.N.ffn_*_shexp).")
-        eprint("       --no-shared-expert produces models that cannot be loaded by llama.cpp.")
-        sys.exit(1)
+        eprint("warning: llama.cpp qwen35moe architecture requires shared expert tensors; "
+               "model may fail to load in llama-cli.")
 
     moe_layers = parse_moe_layers(args.moe_layers, n_layer)
     if args.moe_layers != "all" and moe_layers != set(range(n_layer)):
-        eprint("error: llama.cpp qwen35moe architecture requires all trunk layers to be MoE.")
-        eprint("       partial layer conversion (--moe-layers) produces models that cannot be loaded by llama.cpp.")
-        sys.exit(1)
+        eprint("warning: llama.cpp qwen35moe architecture requires all trunk layers to be MoE; "
+               "model may fail to load in llama-cli.")
 
     if nextn_layers > 0:
         if not args.convert_mtp:
-            eprint("error: llama.cpp qwen35moe architecture requires MTP layer FFN to be converted to MoE.")
-            eprint("       --no-convert-mtp produces models that cannot be loaded by llama.cpp.")
-            sys.exit(1)
-        for i in range(n_layer, n_layer_all):
-            moe_layers.add(i)
+            eprint("warning: llama.cpp qwen35moe architecture requires MTP layer FFN to be converted to MoE; "
+                   "model may fail to load in llama-cli.")
+        else:
+            for i in range(n_layer, n_layer_all):
+                moe_layers.add(i)
 
     eprint(f"  arch:    {arch}")
     eprint(f"  layers:  {n_layer} trunk + {nextn_layers} MTP = {n_layer_all} total")
