@@ -448,6 +448,14 @@ def main():
         base = os.path.splitext(args.input)[0]
         args.output = base + "-moe.gguf"
 
+    # Check for unsupported quantization types in pure Python gguf-py
+    unsupported_kquants = {"Q4_K_M", "Q4_K", "Q5_K", "Q6_K"}
+    if args.output_type in unsupported_kquants:
+        eprint(f"error: output-type '{args.output_type}' is not supported by pure-Python gguf-py (K-quants require C++ ggml quantize).")
+        eprint("hint: convert to Q8_0, F16, or F32 first, then quantize using:")
+        eprint(f"      ..\\llama-b11574-bin-win-cpu-x64\\llama-quantize.exe <converted-model.gguf> <output.gguf> {args.output_type}")
+        sys.exit(1)
+
     out_np_dtype, out_qtype = OUTPUT_DTYPES[args.output_type]
 
     # --- Read input ---
@@ -470,17 +478,31 @@ def main():
 
     expert_ff = args.expert_ff_size if args.expert_ff_size else n_ff
 
+    # Validate against llama.cpp qwen35moe constraints
+    if not args.shared_expert:
+        eprint("error: llama.cpp qwen35moe architecture requires shared expert tensors (blk.N.ffn_*_shexp).")
+        eprint("       --no-shared-expert produces models that cannot be loaded by llama.cpp.")
+        sys.exit(1)
+
+    moe_layers = parse_moe_layers(args.moe_layers, n_layer)
+    if args.moe_layers != "all" and moe_layers != set(range(n_layer)):
+        eprint("error: llama.cpp qwen35moe architecture requires all trunk layers to be MoE.")
+        eprint("       partial layer conversion (--moe-layers) produces models that cannot be loaded by llama.cpp.")
+        sys.exit(1)
+
+    if nextn_layers > 0:
+        if not args.convert_mtp:
+            eprint("error: llama.cpp qwen35moe architecture requires MTP layer FFN to be converted to MoE.")
+            eprint("       --no-convert-mtp produces models that cannot be loaded by llama.cpp.")
+            sys.exit(1)
+        for i in range(n_layer, n_layer_all):
+            moe_layers.add(i)
+
     eprint(f"  arch:    {arch}")
     eprint(f"  layers:  {n_layer} trunk + {nextn_layers} MTP = {n_layer_all} total")
     eprint(f"  n_embd:  {n_embd}, n_ff: {n_ff}")
     eprint(f"  tensors: {len(reader.tensors)}")
     eprint()
-
-    # Parse which layers to convert
-    moe_layers = parse_moe_layers(args.moe_layers, n_layer)
-    if args.convert_mtp and nextn_layers > 0:
-        for i in range(n_layer, n_layer_all):
-            moe_layers.add(i)
 
     eprint(f"Converting {len(moe_layers)} layers to MoE "
            f"({args.num_experts} experts, top-{args.top_k})")
