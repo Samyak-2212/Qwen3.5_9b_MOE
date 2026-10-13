@@ -192,20 +192,21 @@ def maybe_use_torch(use_gpu):
 
 def make_expert_tensor(w_f32, num_experts, noise_scale, rng, is_down):
     """
-    Given a dense FFN weight (float32, shape from GGUF), create a stacked
+    Given a dense FFN weight (float32, NumPy row-major shape), create a stacked
     3D expert tensor.
 
-    GGUF stores tensors in column-major order: the reader gives us shape
-    [ne0, ne1] where ne0 is the fastest dimension.
+    In NumPy row-major order:
+    For ffn_gate / ffn_up: dense shape is (n_ff, n_embd)
+    For ffn_down:          dense shape is (n_embd, n_ff)
 
-    For ffn_gate / ffn_up:  dense shape is [n_embd, n_ff]
-    For ffn_down:            dense shape is [n_ff,  n_embd]
+    Stacking along axis=0 gives:
+      ffn_gate_exps / ffn_up_exps: (n_expert, n_ff_exp, n_embd)
+      ffn_down_exps:                (n_expert, n_embd, n_ff_exp)
 
-    The 3D expert tensors expected by qwen35moe.cpp:
-      ffn_gate_exps / ffn_up_exps:  [n_embd,   n_ff_exp, n_expert]
-      ffn_down_exps:                 [n_ff_exp, n_embd,   n_expert]
-
-    So we stack N copies along the last axis (axis=-1) after adding noise.
+    When written by GGUFWriter (which reverses NumPy dimensions):
+      ffn_gate_exps / ffn_up_exps: [n_embd, n_ff_exp, n_expert]
+      ffn_down_exps:                [n_ff_exp, n_embd, n_expert]
+    Matching qwen35moe.cpp expectations.
     """
     noise_std = noise_scale * float(w_f32.std())
     experts = []
@@ -215,8 +216,8 @@ def make_expert_tensor(w_f32, num_experts, noise_scale, rng, is_down):
         else:
             e = w_f32.copy()
         experts.append(e)
-    # stack along new last axis: shape becomes [..., n_expert]
-    return np.stack(experts, axis=-1)
+    # stack along axis=0 so GGUFWriter packs [fastest, ..., n_expert]
+    return np.stack(experts, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +379,8 @@ def convert_ffn_block(
     prefix = f"blk.{layer_idx}"
 
     # --- Router: small random Gaussian ---
-    router = rng.normal(0.0, 0.02 / np.sqrt(n_embd), (n_embd, num_experts)).astype(np.float32)
+    # Shape (num_experts, n_embd) so GGUF receives [n_embd, num_experts]
+    router = rng.normal(0.0, 0.02 / np.sqrt(n_embd), (num_experts, n_embd)).astype(np.float32)
     writer.add_tensor(f"{prefix}.ffn_gate_inp.weight", router)
     del router
 
