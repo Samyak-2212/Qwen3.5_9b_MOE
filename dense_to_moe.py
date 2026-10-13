@@ -56,7 +56,7 @@ FFN_SUBTENSORS = ("ffn_gate", "ffn_up", "ffn_down")
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args():
+def parse_args(args=None):
     p = argparse.ArgumentParser(
         description="Convert dense Qwen3.5 GGUF to qwen35moe MoE GGUF."
     )
@@ -94,7 +94,7 @@ def parse_args():
                    help="Use torch+CUDA for tensor ops if available")
     p.add_argument("--dry-run", action="store_true", default=False,
                    help="Print plan without writing output file")
-    return p.parse_args()
+    return p.parse_args(args)
 
 
 # ---------------------------------------------------------------------------
@@ -109,35 +109,35 @@ def get_meta_int(reader, key, default=None):
     field = reader.fields.get(key)
     if field is None:
         return default
-    return int(field.parts[field.data[0]])
+    return int(field.parts[field.data[0]].item())
 
 
 def get_meta_float(reader, key, default=None):
     field = reader.fields.get(key)
     if field is None:
         return default
-    return float(field.parts[field.data[0]])
+    return float(field.parts[field.data[0]].item())
 
 
 def get_meta_str(reader, key, default=None):
     field = reader.fields.get(key)
     if field is None:
         return default
-    return str(field.parts[field.data[0]], "utf-8")
+    return str(bytes(field.parts[field.data[0]]), "utf-8")
 
 
 def get_meta_int_arr(reader, key, default=None):
     field = reader.fields.get(key)
     if field is None:
         return default
-    return [int(field.parts[i]) for i in field.data]
+    return [int(field.parts[i].item()) for i in field.data]
 
 
 def get_meta_str_arr(reader, key, default=None):
     field = reader.fields.get(key)
     if field is None:
         return default
-    return [str(field.parts[i], "utf-8") for i in field.data]
+    return [str(bytes(field.parts[i]), "utf-8") for i in field.data]
 
 
 def parse_moe_layers(spec, n_layer):
@@ -227,9 +227,12 @@ def copy_metadata(reader, writer, arch_out, args, n_ff, n_embd, n_layer):
     """Write all metadata from reader to writer, adapting for MoE."""
     from gguf import GGUFValueType
 
-    # Fields to skip (will be rewritten manually)
+    # Fields to skip (synthesized reader fields or rewritten manually)
     skip_keys = {
         "general.architecture",
+        "GGUF.version",
+        "GGUF.tensor_count",
+        "GGUF.kv_count",
         f"{DENSE_ARCH}.expert_count",
         f"{DENSE_ARCH}.expert_used_count",
         f"{DENSE_ARCH}.expert_feed_forward_length",
@@ -253,43 +256,77 @@ def copy_metadata(reader, writer, arch_out, args, n_ff, n_embd, n_layer):
 
         try:
             if vtype == GGUFValueType.STRING:
-                val = str(field.parts[field.data[0]], "utf-8")
+                val = str(bytes(field.parts[field.data[0]]), "utf-8")
                 writer.add_string(out_name, val)
             elif vtype == GGUFValueType.UINT32:
-                writer.add_uint32(out_name, int(field.parts[field.data[0]]))
+                writer.add_uint32(out_name, int(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.INT32:
-                writer.add_int32(out_name, int(field.parts[field.data[0]]))
+                writer.add_int32(out_name, int(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.FLOAT32:
-                writer.add_float32(out_name, float(field.parts[field.data[0]]))
+                writer.add_float32(out_name, float(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.BOOL:
-                writer.add_bool(out_name, bool(field.parts[field.data[0]]))
+                writer.add_bool(out_name, bool(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.UINT64:
-                writer.add_uint64(out_name, int(field.parts[field.data[0]]))
+                writer.add_uint64(out_name, int(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.INT64:
-                writer.add_int64(out_name, int(field.parts[field.data[0]]))
+                writer.add_int64(out_name, int(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.FLOAT64:
-                writer.add_float64(out_name, float(field.parts[field.data[0]]))
+                writer.add_float64(out_name, float(field.parts[field.data[0]].item()))
+            elif vtype == GGUFValueType.UINT8:
+                writer.add_uint8(out_name, int(field.parts[field.data[0]].item()))
+            elif vtype == GGUFValueType.INT8:
+                writer.add_int8(out_name, int(field.parts[field.data[0]].item()))
+            elif vtype == GGUFValueType.UINT16:
+                writer.add_uint16(out_name, int(field.parts[field.data[0]].item()))
+            elif vtype == GGUFValueType.INT16:
+                writer.add_int16(out_name, int(field.parts[field.data[0]].item()))
             elif vtype == GGUFValueType.ARRAY:
                 # nested array -- use element type
                 elem_type = field.types[1] if len(field.types) > 1 else None
                 if elem_type == GGUFValueType.STRING:
-                    vals = [str(field.parts[i], "utf-8") for i in field.data]
+                    vals = [str(bytes(field.parts[i]), "utf-8") for i in field.data]
                     writer.add_array(out_name, vals)
                 elif elem_type == GGUFValueType.INT32:
-                    vals = [int(field.parts[i]) for i in field.data]
-                    writer.add_array(out_name, vals)
-                elif elem_type == GGUFValueType.FLOAT32:
-                    vals = [float(field.parts[i]) for i in field.data]
-                    writer.add_array(out_name, vals)
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    if out_name.endswith(".rope.dimension_sections"):
+                        writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT32)
+                    else:
+                        writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.INT32)
                 elif elem_type == GGUFValueType.UINT32:
-                    vals = [int(field.parts[i]) for i in field.data]
-                    writer.add_array(out_name, vals)
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT32)
+                elif elem_type == GGUFValueType.FLOAT32:
+                    vals = [float(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.FLOAT32)
+                elif elem_type == GGUFValueType.INT64:
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.INT64)
+                elif elem_type == GGUFValueType.UINT64:
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT64)
+                elif elem_type == GGUFValueType.FLOAT64:
+                    vals = [float(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.FLOAT64)
+                elif elem_type == GGUFValueType.BOOL:
+                    vals = [bool(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.BOOL)
+                elif elem_type == GGUFValueType.INT8:
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.INT8)
+                elif elem_type == GGUFValueType.UINT8:
+                    vals = [int(field.parts[i].item()) for i in field.data]
+                    writer.add_key_value(out_name, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT8)
                 else:
                     eprint(f"  skip array field {name}: unsupported elem type {elem_type}")
             else:
                 eprint(f"  skip field {name}: unsupported type {vtype}")
         except Exception as exc:
             eprint(f"  warning: could not copy field {name}: {exc}")
+
+    # Ensure rope.dimension_sections is present
+    rope_sec_key = f"{arch_out}.rope.dimension_sections"
+    if not any(rope_sec_key in kv_data for kv_data in writer.kv_data):
+        writer.add_key_value(rope_sec_key, [11, 11, 10, 0], GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT32)
 
     # Write MoE-specific metadata
     expert_ff = args.expert_ff_size if args.expert_ff_size else n_ff
